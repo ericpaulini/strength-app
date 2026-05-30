@@ -201,6 +201,7 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
   const [summaryData, setSummaryData] = useState(null)
   const timerRef                      = useRef(null)
   const elapsedRef                    = useRef(null)
+  const audioCtxRef                   = useRef(null)
 
   useEffect(() => { loadExercises() }, [])
 
@@ -223,9 +224,18 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
     return () => clearInterval(timerRef.current)
   }, [timer?.seconds])
 
+  function initAudio() {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)()
+    } else if (audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume()
+    }
+  }
+
   function playAlert() {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)()
+      const ctx = audioCtxRef.current
+      if (!ctx) return
       const osc = ctx.createOscillator()
       const gain = ctx.createGain()
       osc.connect(gain); gain.connect(ctx.destination)
@@ -272,6 +282,7 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
   }
 
   async function completeSet(setId, seIdx) {
+    initAudio()
     const { se, sets } = exercises[seIdx]
     await db.set_logs.update(setId, { is_completed: 1, completed_at: now() })
     const remaining = sets.filter(s => s.id !== setId && s.is_completed === 0)
