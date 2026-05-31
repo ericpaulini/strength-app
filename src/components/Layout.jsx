@@ -17,7 +17,7 @@ export default function Layout({ activeTab, setActiveTab, children }) {
       </div>
 
       {/* Bottom tab bar */}
-      <div className="fixed bottom-0 left-0 right-0 bg-gray-800 border-t border-gray-700 flex">
+      <div className="fixed bottom-0 left-0 right-0 bg-gray-800 border-t border-gray-700 flex pb-safe" style={{paddingBottom: 'env(safe-area-inset-bottom)'}}>
         {tabs.map(({ id, label, Icon }) => {
           const active = activeTab === id
           return (
