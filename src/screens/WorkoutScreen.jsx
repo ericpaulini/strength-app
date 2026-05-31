@@ -1,8 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { db } from '../db'
-import { Plus, Check, X, Clock, Dumbbell, Pencil } from 'lucide-react'
+import { Plus, Check, X, Clock, Dumbbell, Pencil, ChevronUp, ChevronDown, History } from 'lucide-react'
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
 function fmt(seconds) {
   const m = Math.floor(seconds / 60)
   const s = seconds % 60
@@ -119,8 +118,8 @@ export default function WorkoutScreen({ startingTemplate, clearTemplate }) {
 
 // ─── Workout Home ─────────────────────────────────────────────────────────────
 function WorkoutHome({ onStartBlank, onStartFromTemplate }) {
-  const [templates, setTemplates]         = useState([])
-  const [showPicker, setShowPicker]       = useState(false)
+  const [templates, setTemplates]           = useState([])
+  const [showPicker, setShowPicker]         = useState(false)
   const [recentSessions, setRecentSessions] = useState([])
 
   useEffect(() => {
@@ -191,20 +190,24 @@ function WorkoutHome({ onStartBlank, onStartFromTemplate }) {
 
 // ─── Live Workout ─────────────────────────────────────────────────────────────
 function LiveWorkout({ session, onFinish, onDiscard }) {
-  const [exercises, setExercises]     = useState([])
-  const [elapsed, setElapsed]         = useState(0)
-  const [volume, setVolume]           = useState(0)
-  const [totalSets, setTotalSets]     = useState(0)
-  const [timer, setTimer]             = useState(null)
-  const [showAddEx, setShowAddEx]     = useState(false)
-  const [showSummary, setShowSummary] = useState(false)
-  const [summaryData, setSummaryData] = useState(null)
-  const timerRef                      = useRef(null)
-  const elapsedRef                    = useRef(null)
-  const audioCtxRef                   = useRef(null)
+  const [exercises, setExercises]       = useState([])
+  const [elapsed, setElapsed]           = useState(0)
+  const [volume, setVolume]             = useState(0)
+  const [totalSets, setTotalSets]       = useState(0)
+  const [timer, setTimer]               = useState(null)
+  const [timerExpired, setTimerExpired] = useState(false)
+  const [showAddEx, setShowAddEx]       = useState(false)
+  const [showSummary, setShowSummary]   = useState(false)
+  const [summaryData, setSummaryData]   = useState(null)
+  const [historyEx, setHistoryEx]       = useState(null)
+  const timerRef                        = useRef(null)
+  const elapsedRef                      = useRef(null)
+  const audioCtxRef                     = useRef(null)
+  const timerEndRef                     = useRef(null)  // absolute time when timer should end
 
   useEffect(() => { loadExercises() }, [])
 
+  // Elapsed ticker
   useEffect(() => {
     elapsedRef.current = setInterval(() => {
       setElapsed(Math.floor((now() - session.started_at) / 1000))
@@ -212,17 +215,54 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
     return () => clearInterval(elapsedRef.current)
   }, [])
 
+  // Handle app backgrounding — adjust timer when returning
+  useEffect(() => {
+    function handleVisibilityChange() {
+      if (document.visibilityState === 'visible' && timerEndRef.current) {
+        const remaining = Math.max(0, Math.ceil((timerEndRef.current - now()) / 1000))
+        setTimer(t => t ? { ...t, seconds: remaining } : null)
+        if (remaining === 0) {
+          setTimer(null)
+          setTimerExpired(true)
+          playAlert()
+        }
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
+  }, [])
+
+  // Timer countdown
   useEffect(() => {
     clearInterval(timerRef.current)
     if (!timer || timer.seconds <= 0) {
-      if (timer?.seconds === 0) playAlert()
+      if (timer?.seconds === 0) {
+        setTimer(null)
+        setTimerExpired(true)
+        playAlert()
+      }
       return
     }
     timerRef.current = setInterval(() => {
-      setTimer(t => t ? { ...t, seconds: t.seconds - 1 } : null)
+      setTimer(t => {
+        if (!t) return null
+        const next = t.seconds - 1
+        if (next <= 0) {
+          clearInterval(timerRef.current)
+          timerEndRef.current = null
+          return { ...t, seconds: 0 }
+        }
+        return { ...t, seconds: next }
+      })
     }, 1000)
     return () => clearInterval(timerRef.current)
-  }, [timer?.seconds])
+  }, [timer?.seconds !== undefined ? Math.ceil(timer.seconds / 5) : null])
+
+  function startTimer(seconds, exerciseIdx) {
+    timerEndRef.current = now() + seconds * 1000
+    setTimerExpired(false)
+    setTimer({ seconds, exerciseIdx })
+  }
 
   function initAudio() {
     if (!audioCtxRef.current) {
@@ -284,16 +324,38 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
   async function completeSet(setId, seIdx) {
     initAudio()
     const { se, sets } = exercises[seIdx]
-    await db.set_logs.update(setId, { is_completed: 1, completed_at: now() })
+
+    // Check for PRs before saving
+    const setData = sets.find(s => s.id === setId)
+    let isPr = 0
+    if (setData && se.exercise_id) {
+      const allLogs = await db.set_logs
+        .where('session_exercise_id')
+        .anyOf(
+          (await db.session_exercises.where('exercise_id').equals(se.exercise_id).toArray())
+            .map(s => s.id)
+        )
+        .filter(s => s.is_completed === 1 && s.id !== setId)
+        .toArray()
+
+      if (setData.weight_lbs && allLogs.length > 0) {
+        const maxWeight = Math.max(...allLogs.map(s => s.weight_lbs || 0))
+        if (setData.weight_lbs > maxWeight) isPr = 1
+      } else if (setData.weight_lbs && allLogs.length === 0) {
+        isPr = 1
+      }
+    }
+
+    await db.set_logs.update(setId, { is_completed: 1, completed_at: now(), is_pr: isPr })
     const remaining = sets.filter(s => s.id !== setId && s.is_completed === 0)
     const isLastSet = remaining.length === 0
     const restSeconds = isLastSet ? se.exercise_rest_seconds : se.rep_rest_seconds
-    setTimer({ seconds: restSeconds, exerciseIdx: seIdx })
+    startTimer(restSeconds, seIdx)
     loadExercises()
   }
 
   async function uncompleteSet(setId) {
-    await db.set_logs.update(setId, { is_completed: 0, completed_at: null })
+    await db.set_logs.update(setId, { is_completed: 0, completed_at: null, is_pr: 0 })
     loadExercises()
   }
 
@@ -322,11 +384,21 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
     const { se, sets } = exercises[seIdx]
     const completedCount = sets.filter(s => s.is_completed).length
     const msg = completedCount > 0
-      ? `You have logged ${completedCount} set(s) for this exercise. Removing it will delete those logged sets from this session.`
+      ? `You have logged ${completedCount} set(s) for this exercise. Removing it will delete those logged sets.`
       : 'Remove this exercise from the workout?'
     if (!window.confirm(msg)) return
     await db.set_logs.where('session_exercise_id').equals(se.id).delete()
     await db.session_exercises.delete(se.id)
+    loadExercises()
+  }
+
+  async function moveExercise(seIdx, dir) {
+    const swapIdx = seIdx + dir
+    if (swapIdx < 0 || swapIdx >= exercises.length) return
+    const a = exercises[seIdx].se
+    const b = exercises[swapIdx].se
+    await db.session_exercises.update(a.id, { position: b.position })
+    await db.session_exercises.update(b.id, { position: a.position })
     loadExercises()
   }
 
@@ -365,22 +437,42 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
   }
 
   if (showAddEx) return (
-    <ExercisePickerForWorkout
-      onSelect={addExercise}
-      onBack={() => setShowAddEx(false)}
-    />
+    <ExercisePickerForWorkout onSelect={addExercise} onBack={() => setShowAddEx(false)} />
+  )
+
+  if (historyEx) return (
+    <ExerciseHistorySheet exercise={historyEx} onBack={() => setHistoryEx(null)} />
   )
 
   if (showSummary) return (
-    <WorkoutSummary
-      session={session}
-      data={summaryData}
-      onDone={onFinish}
-    />
+    <WorkoutSummary session={session} data={summaryData} onDone={onFinish} />
   )
 
   return (
     <div className="flex flex-col h-full">
+      {/* Timer expired banner */}
+      {timerExpired && (
+        <div
+          className="fixed inset-x-0 top-0 z-50 bg-blue-600 shadow-lg animate-slide-down"
+          style={{ top: 'env(safe-area-inset-top)' }}
+        >
+          <div className="flex items-center justify-between px-4 py-4">
+            <div className="flex items-center gap-3">
+              <Clock size={22} className="text-white" />
+              <div>
+                <p className="text-white font-bold text-base">Rest Complete</p>
+                <p className="text-blue-200 text-sm">Time to start your next set</p>
+              </div>
+            </div>
+            <button
+              onClick={() => setTimerExpired(false)}
+              className="bg-white text-blue-600 font-bold px-4 py-2 rounded-lg text-sm">
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div className="bg-gray-800 px-4 pt-4 pb-3 border-b border-gray-700">
         <div className="flex items-center justify-between mb-1">
@@ -399,21 +491,29 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
         </div>
       </div>
 
-      {/* Rest timer banner */}
+      {/* Rest timer bar */}
       {timer && timer.seconds > 0 && (
-        <div className="bg-blue-900 border-b border-blue-700 px-4 py-2 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <Clock size={14} className="text-blue-300" />
-            <span className="text-blue-200 text-sm font-mono font-bold">{fmt(timer.seconds)}</span>
-            <span className="text-blue-400 text-xs">rest</span>
+        <div className="bg-blue-900 border-b border-blue-700 px-4 py-3 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <Clock size={18} className="text-blue-300" />
+            <span className="text-blue-200 text-xl font-mono font-bold">{fmt(timer.seconds)}</span>
+            <span className="text-blue-400 text-sm">rest</span>
           </div>
           <div className="flex items-center gap-2">
-            <button onClick={() => setTimer(t => ({ ...t, seconds: t.seconds + 15 }))}
-              className="text-blue-300 text-xs px-2 py-1 bg-blue-800 rounded">+15s</button>
-            <button onClick={() => setTimer(t => ({ ...t, seconds: Math.max(0, t.seconds - 15) }))}
-              className="text-blue-300 text-xs px-2 py-1 bg-blue-800 rounded">-15s</button>
-            <button onClick={() => setTimer(null)}
-              className="text-blue-300 text-xs px-2 py-1 bg-blue-800 rounded">Skip</button>
+            <button onClick={() => {
+              const newSecs = timer.seconds + 15
+              timerEndRef.current = now() + newSecs * 1000
+              setTimer(t => ({ ...t, seconds: newSecs }))
+            }} className="text-blue-300 text-xs px-2 py-1.5 bg-blue-800 rounded">+15s</button>
+            <button onClick={() => {
+              const newSecs = Math.max(0, timer.seconds - 15)
+              timerEndRef.current = now() + newSecs * 1000
+              setTimer(t => ({ ...t, seconds: newSecs }))
+            }} className="text-blue-300 text-xs px-2 py-1.5 bg-blue-800 rounded">-15s</button>
+            <button onClick={() => {
+              setTimer(null)
+              timerEndRef.current = null
+            }} className="text-blue-300 text-xs px-2 py-1.5 bg-blue-800 rounded">Skip</button>
           </div>
         </div>
       )}
@@ -424,7 +524,7 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
           <div key={se.id} className="bg-gray-800 rounded-xl p-3">
 
             {/* Exercise header */}
-            <div className="flex items-center justify-between mb-3">
+            <div className="flex items-start justify-between mb-3">
               <div className="flex-1">
                 <p className="font-semibold text-sm">{se.exercise_name_snapshot}</p>
                 <RestTimerEdit
@@ -438,10 +538,27 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
                   }}
                 />
               </div>
-              <button onClick={() => removeExercise(seIdx)}
-                className="text-gray-500 hover:text-red-400 p-1">
-                <X size={16} />
-              </button>
+              <div className="flex items-center gap-1 ml-2">
+                {/* History button */}
+                <button onClick={() => setHistoryEx(ex)}
+                  className="text-gray-400 hover:text-blue-400 p-1">
+                  <History size={15} />
+                </button>
+                {/* Reorder buttons */}
+                <button onClick={() => moveExercise(seIdx, -1)}
+                  className="text-gray-400 hover:text-white p-1">
+                  <ChevronUp size={15} />
+                </button>
+                <button onClick={() => moveExercise(seIdx, 1)}
+                  className="text-gray-400 hover:text-white p-1">
+                  <ChevronDown size={15} />
+                </button>
+                {/* Remove button */}
+                <button onClick={() => removeExercise(seIdx)}
+                  className="text-gray-500 hover:text-red-400 p-1">
+                  <X size={15} />
+                </button>
+              </div>
             </div>
 
             {/* Column headers */}
@@ -475,13 +592,11 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
           </div>
         ))}
 
-        {/* Add exercise */}
         <button onClick={() => setShowAddEx(true)}
           className="w-full border border-dashed border-gray-600 text-gray-400 py-3 rounded-xl text-sm flex items-center justify-center gap-2">
           <Plus size={16} /> Add Exercise
         </button>
 
-        {/* Discard */}
         <button onClick={() => {
           if (window.confirm('Discard this workout? All logged sets will be lost.')) onDiscard()
         }} className="w-full text-red-400 text-sm py-2">
@@ -506,7 +621,7 @@ function RestTimerEdit({ se, onSave }) {
   if (!editing) return (
     <div className="flex items-center gap-1 mt-0.5">
       <p className="text-xs text-gray-400">
-        Rep rest: {se.rep_rest_seconds}s · Ex rest: {se.exercise_rest_seconds}s
+        Rep: {se.rep_rest_seconds}s · Ex: {se.exercise_rest_seconds}s
       </p>
       <button onClick={() => setEditing(true)} className="text-gray-500 hover:text-blue-400 p-0.5">
         <Pencil size={11} />
@@ -544,7 +659,10 @@ function SetRow({ set, exerciseType, onComplete, onUncomplete, onUpdate, onRemov
 
   return (
     <div className={`flex gap-2 items-center mb-1.5 rounded-lg p-1 ${done ? 'bg-gray-700 opacity-75' : ''}`}>
-      <span className="text-xs text-gray-400 w-8 text-center">{set.set_number}</span>
+      <div className="w-8 flex flex-col items-center">
+        <span className="text-xs text-gray-400">{set.set_number}</span>
+        {set.is_pr === 1 && <span title="Personal Record">🥇</span>}
+      </div>
 
       <span className="text-xs text-gray-500 w-20">
         {set.target_reps_low
@@ -590,6 +708,75 @@ function SetRow({ set, exerciseType, onComplete, onUncomplete, onUpdate, onRemov
           ${done ? 'bg-green-600' : 'bg-gray-600 hover:bg-gray-500'}`}>
         <Check size={14} />
       </button>
+    </div>
+  )
+}
+
+// ─── Exercise History Sheet ───────────────────────────────────────────────────
+function ExerciseHistorySheet({ exercise, onBack }) {
+  const [history, setHistory] = useState([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => { loadHistory() }, [])
+
+  async function loadHistory() {
+    const sessionExercises = await db.session_exercises
+      .where('exercise_id').equals(exercise.id).toArray()
+    const results = []
+    for (const se of sessionExercises) {
+      const session = await db.workout_sessions.get(se.session_id)
+      const sets = await db.set_logs
+        .where('session_exercise_id').equals(se.id)
+        .filter(s => s.is_completed === 1)
+        .toArray()
+      if (session?.finished_at && sets.length > 0) results.push({ session, sets })
+    }
+    results.sort((a, b) => b.session.started_at - a.session.started_at)
+    setHistory(results)
+    setLoading(false)
+  }
+
+  function formatSet(set) {
+    if (exercise.exercise_type === 'cardio') {
+      const m = Math.floor((set.duration_seconds || 0) / 60)
+      const s = (set.duration_seconds || 0) % 60
+      return `${m}:${String(s).padStart(2,'0')}${set.distance ? ` · ${set.distance}mi` : ''}`
+    }
+    if (exercise.exercise_type === 'bodyweight') return `${set.reps_completed} reps`
+    return `${set.weight_lbs}lbs × ${set.reps_completed}`
+  }
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="bg-gray-800 px-4 pt-4 pb-3 border-b border-gray-700">
+        <button onClick={onBack} className="text-blue-400 text-sm mb-3">← Back to Workout</button>
+        <h1 className="text-xl font-bold">{exercise?.name}</h1>
+        <p className="text-xs text-gray-400 mt-1">Full performance history</p>
+      </div>
+
+      <div className="flex-1 overflow-y-auto p-4 space-y-3">
+        {loading && <p className="text-gray-400 text-sm">Loading...</p>}
+        {!loading && history.length === 0 && (
+          <p className="text-gray-500 text-sm">No history yet for this exercise.</p>
+        )}
+        {history.map(({ session, sets }, i) => (
+          <div key={i} className="bg-gray-800 rounded-lg p-3">
+            <p className="text-xs text-blue-400 font-medium mb-2">
+              {new Date(session.started_at).toLocaleDateString('en-US', {
+                weekday: 'short', month: 'short', day: 'numeric', year: 'numeric'
+              })} · {session.name}
+            </p>
+            {sets.sort((a,b) => a.set_number - b.set_number).map((set, j) => (
+              <div key={j} className="flex justify-between py-1 border-b border-gray-700 last:border-0">
+                <span className="text-xs text-gray-400">Set {set.set_number}</span>
+                <span className="text-xs text-gray-200">
+                  {formatSet(set)}{set.is_pr ? ' 🥇' : ''}
+                </span>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
     </div>
   )
 }
@@ -671,7 +858,7 @@ function WorkoutSummary({ session, data, onDone }) {
                     {ex?.exercise_type === 'strength' ? ` ${s.weight_lbs}lbs × ${s.reps_completed}` : ''}
                     {ex?.exercise_type === 'bodyweight' ? ` ${s.reps_completed} reps` : ''}
                     {ex?.exercise_type === 'cardio' ? ` ${fmt(s.duration_seconds || 0)}${s.distance ? ` · ${s.distance}mi` : ''}` : ''}
-                    {s.is_pr ? ' 🏆 PR' : ''}
+                    {s.is_pr ? ' 🥇 PR' : ''}
                   </p>
                 ))}
               </div>
