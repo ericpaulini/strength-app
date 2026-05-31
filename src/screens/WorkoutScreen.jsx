@@ -70,9 +70,34 @@ export default function WorkoutScreen({ startingTemplate, clearTemplate }) {
     const texes = await db.template_exercises
       .where('template_id').equals(template.id).toArray()
     texes.sort((a, b) => a.position - b.position)
+
     for (let i = 0; i < texes.length; i++) {
       const te = texes[i]
       const ex = await db.exercises.get(te.exercise_id)
+
+      // Find most recent session logs for this exercise
+      const prevSessionExes = await db.session_exercises
+        .where('exercise_id').equals(te.exercise_id).toArray()
+      let prevSets = []
+      if (prevSessionExes.length > 0) {
+        // Get completed sessions only, find most recent
+        let bestSession = null
+        for (const pse of prevSessionExes) {
+          const sess = await db.workout_sessions.get(pse.session_id)
+          if (sess?.finished_at) {
+            if (!bestSession || sess.started_at > bestSession.started_at) {
+              bestSession = { ...sess, seId: pse.id }
+            }
+          }
+        }
+        if (bestSession) {
+          prevSets = await db.set_logs
+            .where('session_exercise_id').equals(bestSession.seId)
+            .filter(s => s.is_completed === 1)
+            .sortBy('set_number')
+        }
+      }
+
       const seId = await db.session_exercises.add({
         session_id: id, exercise_id: te.exercise_id,
         exercise_name_snapshot: ex?.name || 'Unknown',
@@ -81,15 +106,23 @@ export default function WorkoutScreen({ startingTemplate, clearTemplate }) {
         exercise_rest_seconds: te.exercise_rest_override_seconds || template.default_exercise_rest_seconds,
         notes: ''
       })
+
       const sets = await db.template_sets
         .where('template_exercise_id').equals(te.id).sortBy('position')
-      for (const s of sets) {
+
+      for (let j = 0; j < sets.length; j++) {
+        const s = sets[j]
+        // Use previous session's values for this set position if available
+        const prev = prevSets.find(p => p.set_number === s.position)
         await db.set_logs.add({
           session_exercise_id: seId, set_number: s.position,
           drop_number: null, set_type: s.set_type,
           target_reps_low: s.target_reps_low, target_reps_high: s.target_reps_high,
-          weight_lbs: null, reps_completed: null,
-          duration_seconds: null, distance: null, distance_unit: null,
+          weight_lbs: prev?.weight_lbs || null,
+          reps_completed: prev?.reps_completed || null,
+          duration_seconds: prev?.duration_seconds || null,
+          distance: prev?.distance || null,
+          distance_unit: prev?.distance_unit || null,
           is_completed: 0, completed_at: null, is_pr: 0, notes: ''
         })
       }
@@ -196,6 +229,7 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
   const [totalSets, setTotalSets]       = useState(0)
   const [timer, setTimer]               = useState(null)
   const [timerExpired, setTimerExpired] = useState(false)
+  const [timerExName, setTimerExName]   = useState('')
   const [showAddEx, setShowAddEx]       = useState(false)
   const [showSummary, setShowSummary]   = useState(false)
   const [summaryData, setSummaryData]   = useState(null)
@@ -203,11 +237,10 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
   const timerRef                        = useRef(null)
   const elapsedRef                      = useRef(null)
   const audioCtxRef                     = useRef(null)
-  const timerEndRef                     = useRef(null)  // absolute time when timer should end
+  const timerEndRef                     = useRef(null)
 
   useEffect(() => { loadExercises() }, [])
 
-  // Elapsed ticker
   useEffect(() => {
     elapsedRef.current = setInterval(() => {
       setElapsed(Math.floor((now() - session.started_at) / 1000))
@@ -215,16 +248,17 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
     return () => clearInterval(elapsedRef.current)
   }, [])
 
-  // Handle app backgrounding — adjust timer when returning
   useEffect(() => {
     function handleVisibilityChange() {
       if (document.visibilityState === 'visible' && timerEndRef.current) {
         const remaining = Math.max(0, Math.ceil((timerEndRef.current - now()) / 1000))
-        setTimer(t => t ? { ...t, seconds: remaining } : null)
         if (remaining === 0) {
           setTimer(null)
+          timerEndRef.current = null
           setTimerExpired(true)
           playAlert()
+        } else {
+          setTimer(t => t ? { ...t, seconds: remaining } : null)
         }
       }
     }
@@ -232,12 +266,12 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange)
   }, [])
 
-  // Timer countdown
   useEffect(() => {
     clearInterval(timerRef.current)
     if (!timer || timer.seconds <= 0) {
       if (timer?.seconds === 0) {
         setTimer(null)
+        timerEndRef.current = null
         setTimerExpired(true)
         playAlert()
       }
@@ -249,18 +283,18 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
         const next = t.seconds - 1
         if (next <= 0) {
           clearInterval(timerRef.current)
-          timerEndRef.current = null
           return { ...t, seconds: 0 }
         }
         return { ...t, seconds: next }
       })
     }, 1000)
     return () => clearInterval(timerRef.current)
-  }, [timer?.seconds !== undefined ? Math.ceil(timer.seconds / 5) : null])
+  }, [timer?.seconds])
 
-  function startTimer(seconds, exerciseIdx) {
+  function startTimer(seconds, exerciseIdx, exName) {
     timerEndRef.current = now() + seconds * 1000
     setTimerExpired(false)
+    setTimerExName(exName || '')
     setTimer({ seconds, exerciseIdx })
   }
 
@@ -323,34 +357,33 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
 
   async function completeSet(setId, seIdx) {
     initAudio()
-    const { se, sets } = exercises[seIdx]
-
-    // Check for PRs before saving
+    const { se, sets, ex } = exercises[seIdx]
     const setData = sets.find(s => s.id === setId)
-    let isPr = 0
-    if (setData && se.exercise_id) {
-      const allLogs = await db.set_logs
-        .where('session_exercise_id')
-        .anyOf(
-          (await db.session_exercises.where('exercise_id').equals(se.exercise_id).toArray())
-            .map(s => s.id)
-        )
-        .filter(s => s.is_completed === 1 && s.id !== setId)
-        .toArray()
 
-      if (setData.weight_lbs && allLogs.length > 0) {
-        const maxWeight = Math.max(...allLogs.map(s => s.weight_lbs || 0))
-        if (setData.weight_lbs > maxWeight) isPr = 1
-      } else if (setData.weight_lbs && allLogs.length === 0) {
-        isPr = 1
+    // PR detection — compare against all historical completed sets for this exercise
+    let isPr = 0
+    if (setData && se.exercise_id && ex?.exercise_type === 'strength' && setData.weight_lbs) {
+      const allSessionExes = await db.session_exercises
+        .where('exercise_id').equals(se.exercise_id).toArray()
+      const allSetIds = allSessionExes.map(s => s.id)
+      let maxWeight = 0
+      for (const seId of allSetIds) {
+        const logs = await db.set_logs
+          .where('session_exercise_id').equals(seId)
+          .filter(s => s.is_completed === 1 && s.id !== setId && (s.drop_number === null || s.drop_number === 1))
+          .toArray()
+        for (const l of logs) {
+          if ((l.weight_lbs || 0) > maxWeight) maxWeight = l.weight_lbs
+        }
       }
+      if (setData.weight_lbs > maxWeight) isPr = 1
     }
 
     await db.set_logs.update(setId, { is_completed: 1, completed_at: now(), is_pr: isPr })
     const remaining = sets.filter(s => s.id !== setId && s.is_completed === 0)
     const isLastSet = remaining.length === 0
     const restSeconds = isLastSet ? se.exercise_rest_seconds : se.rep_rest_seconds
-    startTimer(restSeconds, seIdx)
+    startTimer(restSeconds, seIdx, se.exercise_name_snapshot)
     loadExercises()
   }
 
@@ -368,7 +401,8 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
       drop_number: null, set_type: 'normal',
       target_reps_low: lastSet?.target_reps_low || null,
       target_reps_high: lastSet?.target_reps_high || null,
-      weight_lbs: null, reps_completed: null,
+      weight_lbs: lastSet?.weight_lbs || null,
+      reps_completed: lastSet?.reps_completed || null,
       duration_seconds: null, distance: null, distance_unit: null,
       is_completed: 0, completed_at: null, is_pr: 0, notes: ''
     })
@@ -410,11 +444,30 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
       superset_group_id: null, rep_rest_seconds: 60,
       exercise_rest_seconds: 90, notes: ''
     })
+    // Pre-fill with last session data
+    const prevSessionExes = await db.session_exercises
+      .where('exercise_id').equals(ex.id).toArray()
+    let prevSets = []
+    let bestSession = null
+    for (const pse of prevSessionExes) {
+      const sess = await db.workout_sessions.get(pse.session_id)
+      if (sess?.finished_at && (!bestSession || sess.started_at > bestSession.started_at)) {
+        bestSession = { ...sess, seId: pse.id }
+      }
+    }
+    if (bestSession) {
+      prevSets = await db.set_logs
+        .where('session_exercise_id').equals(bestSession.seId)
+        .filter(s => s.is_completed === 1)
+        .sortBy('set_number')
+    }
+    const prev = prevSets[0]
     await db.set_logs.add({
       session_exercise_id: seId, set_number: 1,
       drop_number: null, set_type: 'normal',
       target_reps_low: null, target_reps_high: null,
-      weight_lbs: null, reps_completed: null,
+      weight_lbs: prev?.weight_lbs || null,
+      reps_completed: prev?.reps_completed || null,
       duration_seconds: null, distance: null, distance_unit: null,
       is_completed: 0, completed_at: null, is_pr: 0, notes: ''
     })
@@ -450,26 +503,20 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Timer expired banner */}
+
+      {/* Full screen rest complete overlay */}
       {timerExpired && (
-        <div
-          className="fixed inset-x-0 top-0 z-50 bg-blue-600 shadow-lg animate-slide-down"
-          style={{ top: 'env(safe-area-inset-top)' }}
-        >
-          <div className="flex items-center justify-between px-4 py-4">
-            <div className="flex items-center gap-3">
-              <Clock size={22} className="text-white" />
-              <div>
-                <p className="text-white font-bold text-base">Rest Complete</p>
-                <p className="text-blue-200 text-sm">Time to start your next set</p>
-              </div>
-            </div>
-            <button
-              onClick={() => setTimerExpired(false)}
-              className="bg-white text-blue-600 font-bold px-4 py-2 rounded-lg text-sm">
-              Dismiss
-            </button>
-          </div>
+        <div className="fixed inset-0 z-50 bg-blue-700 flex flex-col items-center justify-center text-center px-8"
+          style={{ paddingTop: 'env(safe-area-inset-top)', paddingBottom: 'env(safe-area-inset-bottom)' }}>
+          <Clock size={64} className="text-white mb-6" />
+          <p className="text-white text-4xl font-bold mb-3">Rest Complete</p>
+          <p className="text-blue-200 text-xl mb-2">Time to start your next set</p>
+          {timerExName && <p className="text-blue-300 text-base mb-10">{timerExName}</p>}
+          <button
+            onClick={() => setTimerExpired(false)}
+            className="bg-white text-blue-700 font-bold text-xl px-12 py-5 rounded-2xl">
+            Dismiss
+          </button>
         </div>
       )}
 
@@ -483,9 +530,7 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
           </button>
         </div>
         <div className="flex gap-4 text-xs text-gray-400">
-          <span className="flex items-center gap-1">
-            <Clock size={12} /> {fmt(elapsed)}
-          </span>
+          <span className="flex items-center gap-1"><Clock size={12} /> {fmt(elapsed)}</span>
           <span>{volume.toLocaleString()} lbs</span>
           <span>{totalSets} sets</span>
         </div>
@@ -522,8 +567,6 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
       <div className="flex-1 overflow-y-auto p-3 space-y-3">
         {exercises.map(({ se, ex, sets }, seIdx) => (
           <div key={se.id} className="bg-gray-800 rounded-xl p-3">
-
-            {/* Exercise header */}
             <div className="flex items-start justify-between mb-3">
               <div className="flex-1">
                 <p className="font-semibold text-sm">{se.exercise_name_snapshot}</p>
@@ -539,12 +582,10 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
                 />
               </div>
               <div className="flex items-center gap-1 ml-2">
-                {/* History button */}
                 <button onClick={() => setHistoryEx(ex)}
                   className="text-gray-400 hover:text-blue-400 p-1">
                   <History size={15} />
                 </button>
-                {/* Reorder buttons */}
                 <button onClick={() => moveExercise(seIdx, -1)}
                   className="text-gray-400 hover:text-white p-1">
                   <ChevronUp size={15} />
@@ -553,7 +594,6 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
                   className="text-gray-400 hover:text-white p-1">
                   <ChevronDown size={15} />
                 </button>
-                {/* Remove button */}
                 <button onClick={() => removeExercise(seIdx)}
                   className="text-gray-500 hover:text-red-400 p-1">
                   <X size={15} />
@@ -561,7 +601,6 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
               </div>
             </div>
 
-            {/* Column headers */}
             <div className="flex gap-2 mb-1 px-1">
               <span className="text-xs text-gray-500 w-8">SET</span>
               <span className="text-xs text-gray-500 w-20">TARGET</span>
@@ -572,7 +611,6 @@ function LiveWorkout({ session, onFinish, onDiscard }) {
               <span className="text-xs text-gray-500 w-8 text-center">✓</span>
             </div>
 
-            {/* Sets */}
             {sets.map((set) => (
               <SetRow
                 key={set.id}
@@ -633,14 +671,12 @@ function RestTimerEdit({ se, onSave }) {
     <div className="mt-1 bg-gray-700 rounded-lg p-2 space-y-2">
       <div className="flex items-center gap-2">
         <span className="text-xs text-gray-400 w-20">Rep rest (s)</span>
-        <input type="number" value={repRest}
-          onChange={e => setRepRest(e.target.value)}
+        <input type="number" value={repRest} onChange={e => setRepRest(e.target.value)}
           className="w-20 bg-gray-600 rounded px-2 py-1 text-xs outline-none text-center" />
       </div>
       <div className="flex items-center gap-2">
         <span className="text-xs text-gray-400 w-20">Ex rest (s)</span>
-        <input type="number" value={exRest}
-          onChange={e => setExRest(e.target.value)}
+        <input type="number" value={exRest} onChange={e => setExRest(e.target.value)}
           className="w-20 bg-gray-600 rounded px-2 py-1 text-xs outline-none text-center" />
       </div>
       <div className="flex gap-2">
@@ -659,9 +695,9 @@ function SetRow({ set, exerciseType, onComplete, onUncomplete, onUpdate, onRemov
 
   return (
     <div className={`flex gap-2 items-center mb-1.5 rounded-lg p-1 ${done ? 'bg-gray-700 opacity-75' : ''}`}>
-      <div className="w-8 flex flex-col items-center">
-        <span className="text-xs text-gray-400">{set.set_number}</span>
-        {set.is_pr === 1 && <span title="Personal Record">🥇</span>}
+      <div className="w-8 flex flex-col items-center justify-center">
+        <span className="text-xs text-gray-400 leading-none">{set.set_number}</span>
+        {set.is_pr === 1 && <span className="text-xs leading-none">🥇</span>}
       </div>
 
       <span className="text-xs text-gray-500 w-20">
@@ -737,12 +773,12 @@ function ExerciseHistorySheet({ exercise, onBack }) {
   }
 
   function formatSet(set) {
-    if (exercise.exercise_type === 'cardio') {
+    if (exercise?.exercise_type === 'cardio') {
       const m = Math.floor((set.duration_seconds || 0) / 60)
       const s = (set.duration_seconds || 0) % 60
       return `${m}:${String(s).padStart(2,'0')}${set.distance ? ` · ${set.distance}mi` : ''}`
     }
-    if (exercise.exercise_type === 'bodyweight') return `${set.reps_completed} reps`
+    if (exercise?.exercise_type === 'bodyweight') return `${set.reps_completed} reps`
     return `${set.weight_lbs}lbs × ${set.reps_completed}`
   }
 
@@ -753,7 +789,6 @@ function ExerciseHistorySheet({ exercise, onBack }) {
         <h1 className="text-xl font-bold">{exercise?.name}</h1>
         <p className="text-xs text-gray-400 mt-1">Full performance history</p>
       </div>
-
       <div className="flex-1 overflow-y-auto p-4 space-y-3">
         {loading && <p className="text-gray-400 text-sm">Loading...</p>}
         {!loading && history.length === 0 && (
@@ -785,13 +820,33 @@ function ExerciseHistorySheet({ exercise, onBack }) {
 function ExercisePickerForWorkout({ onSelect, onBack }) {
   const [exercises, setExercises] = useState([])
   const [search, setSearch]       = useState('')
+  const [showCreate, setShowCreate] = useState(false)
 
-  useEffect(() => {
-    db.exercises.orderBy('name').toArray().then(setExercises)
-  }, [])
+  useEffect(() => { loadExercises() }, [])
+
+  async function loadExercises() {
+    const all = await db.exercises.orderBy('name').toArray()
+    setExercises(all)
+  }
+
+  async function handleCreate(newEx) {
+    const id = await db.exercises.add({
+      ...newEx, is_custom: 1, created_at: Date.now()
+    })
+    const saved = await db.exercises.get(id)
+    setShowCreate(false)
+    onSelect(saved)
+  }
 
   const filtered = exercises.filter(e =>
     e.name.toLowerCase().includes(search.toLowerCase())
+  )
+
+  if (showCreate) return (
+    <QuickCreateExercise
+      onSave={handleCreate}
+      onBack={() => setShowCreate(false)}
+    />
   )
 
   return (
@@ -803,6 +858,14 @@ function ExercisePickerForWorkout({ onSelect, onBack }) {
           placeholder="Search..."
           className="w-full bg-gray-700 rounded-lg px-3 py-2 text-sm outline-none" />
       </div>
+
+      {/* Create new button */}
+      <button onClick={() => setShowCreate(true)}
+        className="flex items-center gap-2 px-4 py-3 border-b border-gray-700 bg-gray-800 text-blue-400 hover:bg-gray-700">
+        <Plus size={16} />
+        <span className="text-sm font-medium">Create New Exercise</span>
+      </button>
+
       <div className="flex-1 overflow-y-auto">
         {filtered.map(ex => (
           <button key={ex.id} onClick={() => onSelect(ex)}
@@ -814,6 +877,92 @@ function ExercisePickerForWorkout({ onSelect, onBack }) {
             <Plus size={16} className="text-gray-500" />
           </button>
         ))}
+      </div>
+    </div>
+  )
+}
+
+// ─── Quick Create Exercise (within workout) ───────────────────────────────────
+const MUSCLE_OPTIONS = [
+  'chest','lats','lower_back','upper_back','traps','rear_deltoid','anterior_deltoid',
+  'lateral_deltoid','biceps','brachialis','triceps','quads','hamstrings','glutes',
+  'calves','core','forearms'
+]
+const MUSCLE_LABELS = {
+  chest:'Chest', lats:'Lats', lower_back:'Lower Back', upper_back:'Upper Back',
+  traps:'Traps', rear_deltoid:'Rear Delt', anterior_deltoid:'Front Delt',
+  lateral_deltoid:'Side Delt', biceps:'Biceps', brachialis:'Brachialis',
+  triceps:'Triceps', quads:'Quads', hamstrings:'Hamstrings', glutes:'Glutes',
+  calves:'Calves', core:'Core', forearms:'Forearms'
+}
+const EQUIPMENT_OPTIONS = ['barbell','dumbbell','cable','machine','bodyweight','band','kettlebell','none']
+
+function QuickCreateExercise({ onSave, onBack }) {
+  const [form, setForm] = useState({
+    name: '', exercise_type: 'strength', primary_muscles: '',
+    secondary_muscles: '', equipment: 'dumbbell', movement_type: 'push', notes: ''
+  })
+  const [error, setError] = useState('')
+
+  function set(field, value) { setForm(f => ({ ...f, [field]: value })) }
+
+  async function save() {
+    if (!form.name.trim()) return setError('Name is required.')
+    if (!form.primary_muscles) return setError('Primary muscle is required.')
+    const existing = await db.exercises.where('name').equalsIgnoreCase(form.name.trim()).first()
+    if (existing) return setError('An exercise with this name already exists.')
+    onSave({ ...form, name: form.name.trim() })
+  }
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="bg-gray-800 px-4 pt-4 pb-3 border-b border-gray-700">
+        <button onClick={onBack} className="text-blue-400 text-sm mb-3">← Back</button>
+        <h1 className="text-xl font-bold">New Exercise</h1>
+      </div>
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {error && <p className="text-red-400 text-sm">{error}</p>}
+
+        <div>
+          <p className="text-xs text-gray-400 uppercase mb-1">Name</p>
+          <input value={form.name} onChange={e => set('name', e.target.value)}
+            placeholder="Exercise name"
+            className="w-full bg-gray-700 rounded-lg px-3 py-2 text-sm outline-none" />
+        </div>
+
+        <div>
+          <p className="text-xs text-gray-400 uppercase mb-1">Type</p>
+          <select value={form.exercise_type} onChange={e => set('exercise_type', e.target.value)}
+            className="w-full bg-gray-700 rounded-lg px-3 py-2 text-sm outline-none">
+            <option value="strength">Strength</option>
+            <option value="bodyweight">Bodyweight</option>
+            <option value="cardio">Cardio</option>
+          </select>
+        </div>
+
+        <div>
+          <p className="text-xs text-gray-400 uppercase mb-1">Primary Muscle</p>
+          <select value={form.primary_muscles} onChange={e => set('primary_muscles', e.target.value)}
+            className="w-full bg-gray-700 rounded-lg px-3 py-2 text-sm outline-none">
+            <option value="">Select...</option>
+            {MUSCLE_OPTIONS.map(m => <option key={m} value={m}>{MUSCLE_LABELS[m]}</option>)}
+          </select>
+        </div>
+
+        <div>
+          <p className="text-xs text-gray-400 uppercase mb-1">Equipment</p>
+          <select value={form.equipment} onChange={e => set('equipment', e.target.value)}
+            className="w-full bg-gray-700 rounded-lg px-3 py-2 text-sm outline-none">
+            {EQUIPMENT_OPTIONS.map(eq => (
+              <option key={eq} value={eq}>{eq.charAt(0).toUpperCase() + eq.slice(1)}</option>
+            ))}
+          </select>
+        </div>
+
+        <button onClick={save}
+          className="w-full bg-blue-600 hover:bg-blue-700 py-3 rounded-lg font-semibold">
+          Save & Add to Workout
+        </button>
       </div>
     </div>
   )
